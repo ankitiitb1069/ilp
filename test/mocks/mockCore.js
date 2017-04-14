@@ -53,10 +53,6 @@ class Client extends EventEmitter {
       destinationAmount: req.destinationAmount || "1000"
     })
   }
-
-  sendQuotedPayment () {
-    return Promise.resolve()
-  }
 }
 
 exports.Client = Client

@@ -1,5 +1,6 @@
 'use strict'
 
+const IlpPacket = require('ilp-packet')
 const chai = require('chai')
 const moment = require('moment')
 const assert = chai.assert
@@ -14,18 +15,12 @@ describe('ILQP', function () {
   beforeEach(function () {
     this.plugin = new MockPlugin()
     // quote response
-    this.id = '85e04e5c-2357-4033-ac5b-251ce97faf33'
+    this.id = '85e04e5c-2357-4033-ac5b-251ce97faf33' //XXX
     this.response = {
-      data: {
-        id: this.id,
-        method: 'quote_response',
-        data: {
-          source_amount: '1',
-          destination_amount: '1',
-          source_connector_account: 'test.example.connie',
-          source_expiry_duration: '0'
-        }
-      }
+      ilp: IlpPacket.serializeIlqpBySourceResponse({
+        destinationAmount: '1',
+        sourceHoldDuration: 5
+      })
     }
   })
 
@@ -35,25 +30,21 @@ describe('ILQP', function () {
         sourceAddress: 'test.example.alice',
         destinationAddress: 'test.local.bob',
         sourceAmount: '1',
-        sourceExpiryDuration: '0',
-        destinationExpiryDuration: '0',
+        destinationExpiryDuration: '10',
         connectors: [ 'test.example.connie' ]
       }
       this.result = {
         sourceAmount: '1',
         destinationAmount: '1',
         connectorAccount: 'test.example.connie',
-        sourceExpiryDuration: '0'
+        sourceExpiryDuration: '5'
       }
 
-      this.plugin.sendMessage = (msg) => {
+      this.plugin.sendRequest = (msg) => {
+        assert.equal(msg.ledger, 'test.example.')
         assert.equal(msg.to, 'test.example.connie')
-        assert.isObject(msg.data)
-        assert.equal(msg.data.method, 'quote_request')
-
-        this.response.data.id = msg.data.id
-        this.plugin.emit('incoming_message', this.response)
-        return Promise.resolve(null)
+        assert.isObject(IlpPacket.deserializeIlqpBySourceRequest(Buffer.from(msg.ilp, 'base64')))
+        return Promise.resolve(this.response)
       }
     })
 
@@ -69,6 +60,15 @@ describe('ILQP', function () {
     it('should quote by destination amount', function * () {
       this.params.destinationAmount = this.params.sourceAmount
       delete this.params.sourceAmount
+
+      this.plugin.sendRequest = (msg) => {
+        return Promise.resolve({
+          ilp: IlpPacket.serializeIlqpByDestinationResponse({
+            sourceAmount: '1',
+            sourceHoldDuration: 5
+          })
+        })
+      }
 
       const response = yield ILQP.quote(this.plugin, this.params)
       this.result.expiresAt = (new Date(response.expiresAt)).toISOString()
@@ -104,6 +104,7 @@ describe('ILQP', function () {
 
       // connectorAccount should be set to destination for local ILP payment
       this.result.connectorAccount = this.params.destinationAddress
+      this.result.sourceExpiryDuration = '10'
 
       assert.deepEqual(response,
         this.result)
@@ -122,16 +123,16 @@ describe('ILQP', function () {
         .to.be.rejectedWith(/no connectors specified/)    
     })
 
-    it('should reject on a timeout', function * () {
-      this.plugin.sendMessage = () => Promise.resolve(null)
-      this.params.timeout = 10
-      yield expect(ILQP.quote(this.plugin, this.params))
-        .to.be.rejectedWith(/timed out/)
-    })
-
     describe('quoteByPacket', function () {
       it('should parse quote params from packet', function * () {
-        // the response we're using gives sourceExpiryDuration of 0
+        this.plugin.sendRequest = (msg) => {
+          return Promise.resolve({
+            ilp: IlpPacket.serializeIlqpByDestinationResponse({
+              sourceAmount: '1',
+              sourceHoldDuration: 5
+            })
+          })
+        }
 
         const response = yield ILQP.quoteByPacket(
           this.plugin,
@@ -149,109 +150,63 @@ describe('ILQP', function () {
     })
   })
 
-  describe('_getQuote', function () {
+  describe('quoteByConnector', function () {
     beforeEach(function () {
       this.params = {
-        plugin: this.plugin
+        plugin: this.plugin,
+        connector: 'test.example.connie',
+        quoteQuery: {
+          destinationAccount: 'test.example.bob',
+          sourceAmount: '1',
+          destinationHoldDuration: 3
+        }
       }
     })
 
     it('should return the data from the message response', function * () {
-      this.plugin.sendMessage = (msg) => {
-        this.response.data.id = msg.data.id
-        this.plugin.emit('incoming_message', this.response)
-        return Promise.resolve(null)
+      this.plugin.sendRequest = (msg) => {
+        assert.equal(msg.ledger, 'test.example.')
+        assert.equal(msg.to, 'test.example.connie')
+        assert.deepEqual(IlpPacket.deserializeIlqpBySourceRequest(Buffer.from(msg.ilp, 'base64')), {
+          destinationAccount: 'test.example.bob',
+          sourceAmount: '1',
+          destinationHoldDuration: 3
+        })
+        assert.equal(msg.timeout, 5000)
+        return Promise.resolve(this.response)
       }
 
-      const response = yield ILQP._getQuote(this.params)
+      const response = yield ILQP.quoteByConnector(this.params)
       assert.deepEqual(
         response,
-        this.response.data.data)
+        IlpPacket.deserializeIlqpBySourceResponse(Buffer.from(this.response.ilp, 'base64')))
     })
 
     it('should reject on an error', function * () {
       this.params.timeout = 10
-      yield expect(ILQP._getQuote(this.params))
-        .to.be.rejectedWith(/timed out/)
-    })
-  })
-
-  describe('_sendAndReceiveMessage', function () {
-    beforeEach(function () {
-      this.params = {
-        plugin: this.plugin, 
-        responseMethod: 'quote_response',
-        message: {
-          data: { id: this.id }
-        }
-      }
-    })
-
-    it('should resolve on response message', function * () {
-      const promise = ILQP._sendAndReceiveMessage(this.params)
-      this.plugin.emit('incoming_message', this.response)
-      yield promise
-    })
-
-    it('should ignore a message that doesn\'t match its id', function * () {
-      const promise = ILQP._sendAndReceiveMessage(this.params)
-      
-      this.plugin.emit('incoming_message', {
-        data: {
-          id: 'garbage',
-          method: 'error',
-          data: 'someone else\'s error'
-        }
-      })
-      this.plugin.emit('incoming_message', this.response)
-
-      yield promise
-    })
-
-    it('should reject on error message', function * () {
-      this.response.data.method = 'error'
-      this.response.data.data = { message: 'there was an error' }
-
-      const promise = ILQP._sendAndReceiveMessage(this.params)
-      this.plugin.emit('incoming_message', this.response)
-
-      yield expect(promise)
-        .to.eventually.be.rejectedWith(/there was an error/)
-    })
-
-    it('should time out without response', function * () {
-      this.params.timeout = 10
-      const promise = ILQP._sendAndReceiveMessage(this.params)
-
-      yield expect(promise)
-        .to.eventually.be.rejectedWith(/quote request timed out/)
+      this.plugin.sendRequest = () => Promise.reject(new Error('fail'))
+      yield expect(ILQP.quoteByConnector(this.params))
+        .to.be.rejectedWith(/fail/)
     })
   })
 
   describe('_getCheaperQuote', function () {
-    beforeEach(function () {
-      this.quote1 = { source_amount: '1', destination_amount: '1' }
-      this.quote2 = { source_amount: '1', destination_amount: '1' }
-    })
-
     it('should choose quote1 if it costs less (source)', function () {
-      this.quote1.source_amount = '0.1'
       assert.deepEqual(
-        ILQP._getCheaperQuote(this.quote1, this.quote2),
-        this.quote1)
+        ILQP._getCheaperQuote({sourceAmount: '1'}, {sourceAmount: '2'}),
+        {sourceAmount: '1'})
     })
 
     it('should choose quote1 if it pays more (destination)', function () {
-      this.quote2.destination_amount = '0.1'
       assert.deepEqual(
-        ILQP._getCheaperQuote(this.quote1, this.quote2),
-        this.quote1)
+        ILQP._getCheaperQuote({destinationAmount: '1'}, {destinationAmount: '2'}),
+        {destinationAmount: '2'})
     })
 
     it('should choose quote2 otherwise', function () {
       assert.deepEqual(
-        ILQP._getCheaperQuote(this.quote1, this.quote2),
-        this.quote2)
+        ILQP._getCheaperQuote({destinationAmount: '1'}, {destinationAmount: '1'}),
+        {destinationAmount: '1'})
     })
   })
 })
